@@ -1,0 +1,19 @@
+# ИЗМЕНИТЬ ЭТУ СТРОКУ на абсолютный путь:
+FROM llama3.1
+
+# Исправленный шаблон без bos_token
+TEMPLATE """<|begin_of_text|>
+{{- if .System }}<|start_header_id|>system<|end_header_id|>
+{{ .System }}<|eot_id|>{{- end }}
+<|start_header_id|>user<|end_header_id|>
+{{ .Prompt }}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+"""
+
+SYSTEM """Ты - высококвалифицированный, опытный и осторожный крипто-трейдер и аналитик по управлению рисками. Твоя задача - проанализировать торговый сигнал и предоставить рекомендацию в строгом JSON формате. Ты должен быть максимально краток и точен. Обоснование должно быть 1-2 предложения. Ответ должен быть ТОЛЬКО JSON объектом. Если какой-либо критически важной информации нет или сигнал неоднозначен, всегда выбирай "ОТКЛОНИТЬ"."""
+
+PARAMETER temperature 0.2
+PARAMETER top_k 40
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 8192

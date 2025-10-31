@@ -1,0 +1,75 @@
+[Unit]
+Description=Trading Bot Service
+Documentation=https://github.com/your-repo/trading-bot
+After=network.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tradingbot
+Group=tradingbot
+WorkingDirectory=/opt/trading-bot
+ExecStart=/opt/trading-bot/.venv/bin/python /opt/trading-bot/launcher.py --mode trading
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/opt/trading-bot/start_bot.sh --stop
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+# Ограничения ресурсов
+LimitNOFILE=65536
+LimitNPROC=32768
+
+# Переменные окружения
+Environment=PYTHONPATH=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_LEVEL=INFO
+Environment=BOT_MODE=trading
+Environment=TZ=UTC
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/data /opt/trading-bot/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Сетевые ограничения
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=10.0.0.0/8
+IPAddressAllow=172.16.0.0/12
+IPAddressAllow=192.168.0.0/16
+
+[Install]
+WantedBy=multi-user.target
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

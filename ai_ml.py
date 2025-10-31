@@ -1,0 +1,1555 @@
+# ai_ml.py
+import os
+os.environ.setdefault("MLX_DEFAULT_DEVICE", "cpu")
+os.environ.setdefault("METAL_DEVICE_WRAPPER_TYPE", "1")
+
+import logging
+import json
+import pickle
+import re
+import asyncio
+from collections import deque
+from typing import Dict, Any, Optional  # <-- Добавил Optional
+
+import math
+import numpy as np
+import pandas as pd
+import joblib
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import SGDClassifier
+from sklearn.feature_extraction import DictVectorizer
+import mlx
+import mlx.nn as mlx_nn
+import mlx.optimizers as mlx_optim
+from safetensors.numpy import save_file as save_safetensors, load_file as load_safetensors
+from openai import AsyncOpenAI
+
+import config
+from utils import safe_to_float, safe_parse_json, compute_pct
+import utils
+
+logger = logging.getLogger(__name__)
+
+SIGNAL_FEATURE_COLUMNS = [
+    "pct1m",
+    "pct5m",
+    "pct15m",
+    "dOI1m",
+    "dOI5m",
+    "GS_dOI4m",
+    "CVD1m",
+    "CVD5m",
+    "volume_anomaly",
+    "vol1m",
+    "vol5m",
+    "vol15m",
+    "rsi14",
+    "adx14",
+    "delta_cvd1m",
+    "delta_cvd5m",
+    "prev_cvd1m",
+    "prev_cvd5m",
+    "cvd1m_sign_change",
+    "cvd5m_sign_change",
+    "delta_pct5m",
+]
+
+# Константы для анализа ответов AI
+NEGATIVE_CUES = {
+    "негатив", "опас", "перегрет", "переоцен", "risk", "bear", "downtrend",
+    "слабый спрос", "дистрибуц", "падени", "разворот вниз", "sell-off", "dump"
+}
+
+# --- Классы моделей и инференса ---
+
+
+def _sigmoid_stable(z: float) -> float:
+    z = float(z)
+    if z >= 0:
+        ez = math.exp(-z) if z < 88.0 else 0.0
+        return 1.0 / (1.0 + ez)
+    else:
+        ez = math.exp(z) if z > -88.0 else 0.0
+        return ez / (1.0 + ez)
+
+
+_ML_INFER = None
+def get_inferencer():
+    global _ML_INFER
+    if _ML_INFER is None:
+        _ML_INFER = MLXInferencer()
+    return _ML_INFER
+
+
+_SIGNAL_MODEL = None
+
+
+def get_signal_model():
+    global _SIGNAL_MODEL
+    if _SIGNAL_MODEL is None:
+        _SIGNAL_MODEL = SignalModelInferencer()
+    return _SIGNAL_MODEL
+
+
+def score_signal_probability(symbol: str, side: str, features: Dict[str, Any], duration_sec: float = 0.0) -> Optional[float]:
+    clf = get_signal_model()
+    if clf is None or not clf.enabled:
+        return None
+    return clf.score(symbol, side, features, duration_sec)
+
+
+def build_training_samples_from_csv(csv_path: Path | str) -> list[dict]:
+    """
+    Собирает обучающую выборку из trades_unified.csv с учётом FEATURE_KEYS.
+    """
+    path = Path(csv_path)
+    if not path.exists():
+        logger.warning(f"[MLX] trades_unified.csv не найден: {path}")
+        return []
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        logger.error(f"[MLX] Ошибка чтения {path}: {e}")
+        return []
+
+    if df.empty:
+        return []
+
+    df["timestamp"] = pd.to_datetime(df.get("timestamp"), errors="coerce")
+    df = df.dropna(subset=["timestamp", "symbol", "event"])
+    if df.empty:
+        return []
+
+    df = df.sort_values("timestamp")
+    opens = df[df["event"] == "open"].copy()
+    closes = df[df["event"] == "close"].copy()
+    if opens.empty or closes.empty:
+        return []
+
+    closes_by_symbol = {sym: grp.reset_index(drop=True) for sym, grp in closes.groupby("symbol")}
+    target_threshold = float(getattr(config, "ML_TARGET_MIN_PNL_PCT", 0.5))
+
+    samples: list[dict] = []
+    feature_keys = list(getattr(config, "FEATURE_KEYS", []))
+
+    for _, open_row in opens.iterrows():
+        symbol = open_row["symbol"]
+        sym_closes = closes_by_symbol.get(symbol)
+        if sym_closes is None:
+            continue
+
+        open_ts = open_row["timestamp"]
+        idx = sym_closes["timestamp"].searchsorted(open_ts, side="right")
+        if idx >= len(sym_closes):
+            continue
+
+        close_row = sym_closes.iloc[idx]
+        pnl_pct = safe_to_float(close_row.get("pnl_pct"))
+        if not math.isfinite(pnl_pct):
+            continue
+
+        target = 1.0 if pnl_pct >= target_threshold else 0.0
+        feature_vector: list[float] = []
+        for key in feature_keys:
+            val = safe_to_float(open_row.get(key))
+            if not math.isfinite(val):
+                val = 0.0
+            feature_vector.append(val)
+
+        samples.append({"features": feature_vector, "target": target})
+
+    logger.info(f"[MLX] Собрано {len(samples)} обучающих сэмплов из {path.name}.")
+    return samples
+
+# def score_from_feature_dict(feats: dict) -> float:
+#     order = getattr(config, "FEATURE_KEYS", [])
+#     x = np.array([[safe_to_float(feats.get(k, 0.0)) for k in order]], dtype=np.float32)
+#     logits = get_inferencer().infer(x)  # shape (1,1), логит
+#     return float(_sigmoid_stable(logits.squeeze()))
+
+
+# ai_ml.py
+def score_from_feature_dict(feats: dict) -> float:
+    order = getattr(config, "FEATURE_KEYS", [])
+    x = np.array([[utils.safe_to_float(feats.get(k, 0.0)) for k in order]], dtype=np.float32)
+
+    logits = get_inferencer().infer(x)  # может вернуть np.array, list, tensor и т.п.
+    try:
+        # вытаскиваем первый скаляр вне зависимости от формы
+        logit = float(np.asarray(logits).ravel()[0])
+    except Exception as e:
+        logger.warning(f"[ML] bad logits: {type(logits)} err={e}")
+        return 0.5
+
+    if not np.isfinite(logit):
+        logger.warning(f"[ML] non-finite logit: {logit}")
+        return 0.5
+
+    # клип логита (доп. защита) и стабильный сигмоид
+    if abs(logit) > 50.0:
+        logger.debug(f"[ML] extreme logit clipped: {logit:.2f}")
+        logit = 50.0 if logit > 0 else -50.0
+
+    p = _sigmoid_stable(logit)
+    # лёгкий клип на концах, чтобы не было 0/1
+    EPS = 1e-6
+    return float(min(max(p, EPS), 1.0 - EPS))
+
+
+
+def prepare_mkt_features(self, base_feats: dict, market_ctx: dict, cluster_metrics: dict) -> dict:
+    """
+    Back-compat: прежние стратегии вызывали prepare_mkt_features.
+    Теперь просто проксируем на prepare_features.
+    """
+    return self.prepare_features(base_feats, market_ctx, cluster_metrics)
+
+class GoldenNetMLX(mlx_nn.Module):
+    """Нейронная сеть на MLX для предсказания качества входа."""
+    def __init__(self, input_size: int, hidden_size: int = 64):
+        super().__init__()
+        self.fc1 = mlx_nn.Linear(input_size, hidden_size)
+        self.bn1 = mlx_nn.BatchNorm(hidden_size)
+        self.fc2 = mlx_nn.Linear(hidden_size, hidden_size)
+        self.bn2 = mlx_nn.BatchNorm(hidden_size)
+        self.fc3 = mlx_nn.Linear(hidden_size, 1)
+        self.dropout = mlx_nn.Dropout(0.2)
+
+    def __call__(self, x):
+        x = mlx_nn.relu(self.bn1(self.fc1(x)))
+        x = self.dropout(x)
+        x = mlx_nn.relu(self.bn2(self.fc2(x)))
+        x = self.fc3(x)
+        return x
+
+    def state_dict_numpy(self) -> dict:
+        """Собирает веса слоёв в dict numpy-массивов для safetensors."""
+        to_np = lambda t: np.array(t)
+        sd = {
+            "fc1.weight": to_np(self.fc1.weight), "fc1.bias": to_np(self.fc1.bias),
+            "bn1.weight": to_np(self.bn1.weight), "bn1.bias": to_np(self.bn1.bias),
+            "bn1.running_mean": to_np(self.bn1.running_mean), "bn1.running_var": to_np(self.bn1.running_var),
+            "fc2.weight": to_np(self.fc2.weight), "fc2.bias": to_np(self.fc2.bias),
+            "bn2.weight": to_np(self.bn2.weight), "bn2.bias": to_np(self.bn2.bias),
+            "bn2.running_mean": to_np(self.bn2.running_mean), "bn2.running_var": to_np(self.bn2.running_var),
+            "fc3.weight": to_np(self.fc3.weight), "fc3.bias": to_np(self.fc3.bias),
+        }
+        return sd
+
+    def load_weights(self, path: str):
+        """Загружает веса из safetensors в слои MLX."""
+        tensors = load_safetensors(path)
+        to_mlx = mlx.core.array
+        self.fc1.weight, self.fc1.bias = to_mlx(tensors["fc1.weight"]), to_mlx(tensors["fc1.bias"])
+        self.bn1.weight, self.bn1.bias = to_mlx(tensors["bn1.weight"]), to_mlx(tensors["bn1.bias"])
+        self.bn1.running_mean, self.bn1.running_var = to_mlx(tensors["bn1.running_mean"]), to_mlx(tensors["bn1.running_var"])
+        self.fc2.weight, self.fc2.bias = to_mlx(tensors["fc2.weight"]), to_mlx(tensors["fc2.bias"])
+        self.bn2.weight, self.bn2.bias = to_mlx(tensors["bn2.weight"]), to_mlx(tensors["bn2.bias"])
+        self.bn2.running_mean, self.bn2.running_var = to_mlx(tensors["bn2.running_mean"]), to_mlx(tensors["bn2.running_var"])
+        self.fc3.weight, self.fc3.bias = to_mlx(tensors["fc3.weight"]), to_mlx(tensors["fc3.bias"])
+
+class MLXInferencer:
+    """Класс для загрузки модели, скейлера и выполнения предсказаний."""
+    def __init__(self, model_path: Path | str | None = None, scaler_path: Path | str | None = None):
+        self.model: Optional[GoldenNetMLX] = None
+        self.scaler: Optional[StandardScaler] = None
+        self.model_path = Path(model_path) if model_path is not None else Path(config.ML_MODEL_PATH)
+        self.scaler_path = Path(scaler_path) if scaler_path is not None else Path(config.SCALER_PATH)
+        self.auto_train_enabled = bool(getattr(config, "ML_AUTO_TRAIN_ENABLED", True))
+        self._autoload_attempted = False
+
+        self._load_model()
+        self._load_scaler()
+
+    def _load_model(self) -> bool:
+        if not self.model_path.exists():
+            logger.warning(f"[MLXInferencer] Файл модели не найден: {self.model_path}.")
+            self.model = None
+            return False
+        try:
+            self.model = GoldenNetMLX(input_size=len(config.FEATURE_KEYS))
+            self.model.load_weights(str(self.model_path))
+            self.model.eval()
+            in_dim = int(self.model.fc1.weight.shape[-1])
+            expected = len(config.FEATURE_KEYS)
+            if in_dim != expected:
+                logger.warning(
+                    "[MLXInferencer] Модель %s имеет вход %d фич, ожидалось %d. Помечаю как некорректную.",
+                    self.model_path.name,
+                    in_dim,
+                    expected,
+                )
+                self.model = None
+                return False
+            logger.info(f"[MLXInferencer] Модель {self.model_path.name} загружена.")
+            return True
+        except Exception as e:
+            logger.error(f"[MLXInferencer] Ошибка загрузки модели {self.model_path}: {e}", exc_info=True)
+            self.model = None
+            return False
+
+    def _load_scaler(self) -> bool:
+        if not self.scaler_path.exists():
+            logger.warning(f"[MLXInferencer] Файл скейлера не найден: {self.scaler_path}.")
+            self.scaler = None
+            return False
+        try:
+            self.scaler = joblib.load(self.scaler_path)
+            expected = len(config.FEATURE_KEYS)
+            n_features = getattr(self.scaler, "n_features_in_", expected)
+            if n_features != expected:
+                logger.warning(
+                    "[MLXInferencer] Скейлер %s обучен на %d фичах, ожидалось %d. Помечаю как некорректный.",
+                    self.scaler_path.name,
+                    n_features,
+                    expected,
+                )
+                self.scaler = None
+                return False
+            logger.info(f"[MLXInferencer] Скейлер {self.scaler_path.name} загружен.")
+            return True
+        except Exception as e:
+            logger.error(f"[MLXInferencer] Ошибка загрузки скейлера {self.scaler_path}: {e}", exc_info=True)
+            self.scaler = None
+            return False
+
+    def _ensure_ready(self):
+        if self.model is not None or not self.auto_train_enabled:
+            return
+        if self._autoload_attempted:
+            return
+        self._autoload_attempted = True
+
+        try:
+            samples = build_training_samples_from_csv(config.TRADES_UNIFIED_CSV_PATH)
+            min_samples = int(getattr(config, "ML_AUTO_TRAIN_MIN_SAMPLES", 200))
+            if len(samples) < min_samples:
+                logger.warning(f"[MLXInferencer] Недостаточно данных ({len(samples)}) для автообучения.")
+                return
+
+            epochs = int(getattr(config, "ML_AUTO_TRAIN_EPOCHS", 40))
+            logger.info(f"[MLXInferencer] Автообучение модели (samples={len(samples)}, epochs={epochs}).")
+            model, scaler = train_golden_model_mlx(samples, num_epochs=epochs)
+            save_mlx_checkpoint(model, scaler, self.model_path, self.scaler_path)
+            self._load_model()
+            self._load_scaler()
+        except Exception as e:
+            logger.error(f"[MLXInferencer] Ошибка автообучения: {e}", exc_info=True)
+
+    def infer(self, features: np.ndarray) -> np.ndarray:
+        self._ensure_ready()
+        if self.model is None:
+            logger.warning("[MLXInferencer] Запрос инференса, но модель не готова. Возвращаю 0.0.")
+            return np.array([[0.0]])
+
+        if self.scaler:
+            try:
+                features = self.scaler.transform(features)
+            except Exception as e:
+                logger.error(f"[MLXInferencer] Ошибка при масштабировании признаков: {e}. Использую нескалированные фичи.", exc_info=True)
+                self.scaler = None
+
+        try:
+            prediction = self.model(mlx.core.array(features))
+        except Exception as e:
+            logger.error(f"[MLXInferencer] Ошибка инференса модели: {e}. Помечаю модель как невалидную.", exc_info=True)
+            self.model = None
+            return np.array([[0.0]])
+        return np.array(prediction)
+
+
+class SignalModelInferencer:
+    """Загрузчик LightGBM (или аналогичного) классификатора по сделкам."""
+
+    def __init__(self):
+        cfg = dict(getattr(config, "SIGNAL_MODEL", {}))
+        self.enabled = bool(cfg.get("ENABLED", True))
+        self.threshold = utils.safe_to_float(cfg.get("THRESHOLD", 0.6))
+        model_path = cfg.get("MODEL_PATH") or (config.ROOT_DIR / "analysis/models/signal_model.pkl")
+        vectorizer_path = cfg.get("VECTORIZER_PATH") or (config.ROOT_DIR / "analysis/models/signal_vectorizer.pkl")
+        self.model_path = Path(model_path)
+        self.vectorizer_path = Path(vectorizer_path)
+        self.model = None
+        self.vectorizer: Optional[DictVectorizer] = None
+        self._load()
+
+    def _load(self) -> None:
+        if not self.enabled:
+            return
+        if not self.model_path.exists() or not self.vectorizer_path.exists():
+            logger.warning(
+                "[SignalModel] Не найдены артефакты модели (%s, %s).",
+                self.model_path,
+                self.vectorizer_path,
+            )
+            self.enabled = False
+            return
+        try:
+            with self.model_path.open("rb") as fp:
+                self.model = pickle.load(fp)
+            with self.vectorizer_path.open("rb") as fp:
+                self.vectorizer = pickle.load(fp)
+            logger.info(
+                "[SignalModel] Загружены модель %s и vectorizer %s.",
+                self.model_path.name,
+                self.vectorizer_path.name,
+            )
+        except Exception as exc:  # pragma: no cover - дефенсивный блок
+            logger.error(f"[SignalModel] Ошибка загрузки модели: {exc}", exc_info=True)
+            self.enabled = False
+            self.model = None
+            self.vectorizer = None
+
+    def score(self, symbol: str, side: str, features: Dict[str, Any], duration_sec: float = 0.0) -> Optional[float]:
+        if not self.enabled or self.model is None or self.vectorizer is None:
+            return None
+        sample = {
+            "symbol": symbol,
+            "side": side.capitalize(),
+            "duration_sec": duration_sec,
+        }
+        for key in SIGNAL_FEATURE_COLUMNS:
+            sample[f"feature_{key}"] = safe_to_float(features.get(key, 0.0))
+        try:
+            X = self.vectorizer.transform([sample])
+            if hasattr(self.model, "predict_proba"):
+                proba = self.model.predict_proba(X)[0][1]
+            elif hasattr(self.model, "decision_function"):
+                logit = float(self.model.decision_function(X)[0])
+                proba = _sigmoid_stable(logit)
+            else:
+                pred = self.model.predict(X)[0]
+                proba = float(pred)
+            return float(proba)
+        except Exception as exc:
+            logger.error(f"[SignalModel] Ошибка инференса: {exc}", exc_info=True)
+            return None
+
+
+# --- Функции обучения и сохранения ---
+
+def train_golden_model_mlx(training_data, num_epochs: int = 30, lr: float = 1e-3):
+    logger.info("[MLX] Запуск обучения на MLX...")
+    feats = np.asarray([d["features"] for d in training_data], dtype=np.float32)
+    targ = np.asarray([d["target"] for d in training_data], dtype=np.float32)
+    mask = ~(np.isnan(feats).any(1) | np.isinf(feats).any(1))
+    feats, targ = feats[mask], targ[mask]
+    if feats.size == 0:
+        raise ValueError("train_golden_model_mlx: нет валидных сэмплов")
+
+    scaler = StandardScaler().fit(feats)
+    feats_scaled = scaler.transform(feats).astype(np.float32)
+    targ = targ.reshape(-1, 1)
+
+    model = GoldenNetMLX(input_size=feats_scaled.shape[1])
+    optimizer = mlx_optim.Adam(learning_rate=lr)
+    loss_fn = lambda m, x, y: mlx_nn.losses.mse_loss(m(x), y).mean()
+    loss_and_grad_fn = mlx_nn.value_and_grad(model, loss_fn)
+
+    for epoch in range(num_epochs):
+        x_train, y_train = mlx.core.array(feats_scaled), mlx.core.array(targ)
+        loss, grads = loss_and_grad_fn(model, x_train, y_train)
+        optimizer.update(model, grads)
+        mlx.core.eval(model.parameters(), optimizer.state)
+        if (epoch + 1) % 5 == 0:
+            logger.info(f"Epoch {epoch+1} [MLX] – Loss: {loss.item():.5f}")
+
+    return model, scaler
+
+def save_mlx_checkpoint(
+    model: GoldenNetMLX,
+    scaler: StandardScaler,
+    model_path: str | Path | None = None,
+    scaler_path: str | Path | None = None,
+):
+    model_dest = Path(model_path) if model_path is not None else Path(config.ML_MODEL_PATH)
+    scaler_dest = Path(scaler_path) if scaler_path is not None else Path(config.SCALER_PATH)
+    tensors = model.state_dict_numpy()
+    save_safetensors(tensors, str(model_dest))
+    joblib.dump(scaler, scaler_dest)
+    logger.info(f"Модель сохранена → {model_dest}; scaler → {scaler_dest}")
+
+
+class OnlinePolicyLearner:
+    """
+    Простая онлайн-обучаемая политика, которая оценивает вероятность
+    успешной сделки и подстраивает решения об открытии/закрытии.
+    Основана на SGDClassifier с логистической регрессией.
+    """
+
+    def __init__(self, expected_dim: int, cfg: Optional[dict] = None):
+        self.cfg = cfg or getattr(config, "ML_POLICY", {})
+        self.enabled = bool(self.cfg.get("ENABLED", False))
+        self.expected_dim = int(expected_dim)
+
+        if not self.enabled:
+            self.model = None
+            self.scaler = None
+            return
+
+        self.state_path = Path(self.cfg.get("STATE_PATH", config.ROOT_DIR / "ml_policy_state.pkl"))
+        self.min_samples = max(1, int(self.cfg.get("MIN_TRAIN_SAMPLES", 200)))
+        self.target_pnl_pct = float(self.cfg.get("TARGET_PNL_PCT", 0.5))
+        self.entry_threshold = float(self.cfg.get("ENTRY_THRESHOLD", 0.55))
+        self.exit_threshold = float(self.cfg.get("EXIT_THRESHOLD", 0.35))
+        self.min_hold_sec = float(self.cfg.get("MIN_HOLD_SEC", 60.0))
+        self.save_interval = max(1, int(self.cfg.get("SAVE_INTERVAL", 50)))
+        self.max_buffer = max(self.min_samples, int(self.cfg.get("MAX_BUFFER", 5000)))
+        self.apply_sources = [str(x).lower() for x in self.cfg.get("APPLY_SOURCES", [])]
+        self.bypass_when_unfit = bool(self.cfg.get("BYPASS_WHEN_UNFIT", True))
+
+        self.model: Optional[SGDClassifier] = None
+        self.scaler = StandardScaler(with_mean=False)
+        self.is_fitted = False
+        self.samples_seen = 0
+        self.samples_since_save = 0
+        self.buffer: deque[tuple[np.ndarray, int]] = deque(maxlen=self.max_buffer)
+        self._classes = np.array([0, 1], dtype=np.int32)
+
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            state = joblib.load(self.state_path)
+            model = state.get("model")
+            scaler = state.get("scaler")
+            feature_dim = int(state.get("feature_dim", self.expected_dim))
+            samples_seen = int(state.get("samples_seen", 0))
+            if feature_dim != self.expected_dim:
+                logger.warning(
+                    "[PolicyLearner] Несовпадение размерности (state=%d, expected=%d). Игнорирую сохранённую модель.",
+                    feature_dim,
+                    self.expected_dim,
+                )
+                return
+            if isinstance(model, SGDClassifier) and isinstance(scaler, StandardScaler):
+                self.model = model
+                self.scaler = scaler
+                self.is_fitted = True
+                self.samples_seen = samples_seen
+                logger.info("[PolicyLearner] Загружено состояние из %s (samples=%d).", self.state_path, samples_seen)
+        except Exception as exc:
+            logger.warning(f"[PolicyLearner] Не удалось загрузить состояние ({exc}).")
+
+    def _ensure_model(self) -> None:
+        if self.model is None:
+            self.model = SGDClassifier(
+                loss="log_loss",
+                learning_rate="optimal",
+                penalty="l2",
+                alpha=1e-4,
+                fit_intercept=True,
+            )
+
+    def should_apply(self, source: str) -> bool:
+        if not self.enabled:
+            return False
+        if not self.apply_sources:
+            return True
+        source_lower = (source or "").lower()
+        return any(token in source_lower for token in self.apply_sources)
+
+    def get_entry_threshold(self) -> float:
+        return float(self.entry_threshold)
+
+    def get_exit_threshold(self) -> float:
+        return float(self.exit_threshold)
+
+    def get_min_hold_sec(self) -> float:
+        return float(self.min_hold_sec)
+
+    def score(self, vector: np.ndarray) -> Optional[float]:
+        if not self.enabled or not self.is_fitted or self.model is None:
+            return None
+        arr = np.asarray(vector, dtype=np.float32).reshape(1, -1)
+        if arr.shape[1] != self.expected_dim:
+            logger.debug(
+                "[PolicyLearner] Некорректная размерность входа (%d != %d).",
+                arr.shape[1],
+                self.expected_dim,
+            )
+            return None
+        try:
+            if hasattr(self.scaler, "n_samples_seen_"):
+                arr = self.scaler.transform(arr)
+        except Exception as exc:
+            logger.warning(f"[PolicyLearner] Ошибка масштабирования признаков: {exc}")
+        try:
+            if hasattr(self.model, "predict_proba"):
+                proba = self.model.predict_proba(arr)[0][1]
+            else:
+                logit = float(self.model.decision_function(arr)[0])
+                proba = _sigmoid_stable(logit)
+            return float(np.clip(proba, 0.0, 1.0))
+        except Exception as exc:
+            logger.warning(f"[PolicyLearner] Ошибка при расчёте score: {exc}")
+            return None
+
+    def update(self, vector: np.ndarray, pnl_pct: float) -> None:
+        if not self.enabled:
+            return
+        arr = np.asarray(vector, dtype=np.float32).reshape(1, -1)
+        if arr.shape[1] != self.expected_dim:
+            logger.debug(
+                "[PolicyLearner] Попытка обновления с неверной размерностью (%d != %d).",
+                arr.shape[1],
+                self.expected_dim,
+            )
+            return
+
+        if not np.all(np.isfinite(arr)):
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        target = 1 if float(pnl_pct) >= self.target_pnl_pct else 0
+        self.buffer.append((arr, target))
+
+        if not self.is_fitted:
+            if len(self.buffer) < self.min_samples:
+                return
+            X = np.vstack([item[0] for item in self.buffer])
+            y = np.array([item[1] for item in self.buffer], dtype=np.int32)
+            try:
+                self.scaler.partial_fit(X)
+            except Exception as exc:
+                logger.warning(f"[PolicyLearner] Ошибка partial_fit scaler: {exc}")
+            X_scaled = self.scaler.transform(X)
+            self._ensure_model()
+            try:
+                self.model.partial_fit(X_scaled, y, classes=self._classes)
+                self.is_fitted = True
+                self.samples_seen += len(self.buffer)
+                self.samples_since_save += len(self.buffer)
+                self.buffer.clear()
+                logger.info("[PolicyLearner] Модель инициализирована (batch=%d).", len(y))
+            except Exception as exc:
+                logger.warning(f"[PolicyLearner] Ошибка первичного обучения: {exc}")
+                self.buffer.clear()
+            if self.samples_since_save >= self.save_interval:
+                self._save_state()
+            return
+
+        # Инкрементальное обновление
+        try:
+            self.scaler.partial_fit(arr)
+            arr_scaled = self.scaler.transform(arr)
+        except Exception as exc:
+            logger.warning(f"[PolicyLearner] Ошибка обновления скейлера: {exc}")
+            arr_scaled = arr
+
+        self._ensure_model()
+        try:
+            self.model.partial_fit(arr_scaled, np.array([target], dtype=np.int32))
+            self.samples_seen += 1
+            self.samples_since_save += 1
+        except Exception as exc:
+            logger.warning(f"[PolicyLearner] Ошибка partial_fit модели: {exc}")
+
+        if self.samples_since_save >= self.save_interval:
+            self._save_state()
+
+    def _save_state(self) -> None:
+        try:
+            state = {
+                "model": self.model,
+                "scaler": self.scaler,
+                "feature_dim": self.expected_dim,
+                "samples_seen": self.samples_seen,
+            }
+            joblib.dump(state, self.state_path)
+            self.samples_since_save = 0
+            logger.info("[PolicyLearner] Состояние сохранено (%s).", self.state_path)
+        except Exception as exc:
+            logger.warning(f"[PolicyLearner] Не удалось сохранить состояние: {exc}")
+
+    def reset(self) -> None:
+        """Сбрасывает состояние обученной политики."""
+        self.model = None
+        self.scaler = StandardScaler(with_mean=False)
+        self.is_fitted = False
+        self.samples_seen = 0
+        self.samples_since_save = 0
+        self.buffer.clear()
+        try:
+            if self.state_path.exists():
+                self.state_path.unlink()
+        except Exception as exc:
+            logger.warning(f"[PolicyLearner] Не удалось удалить state file: {exc}")
+
+# --- Взаимодействие с AI ---
+
+def _ask_ollama_json_sync(model: str, messages: list[dict], base_url: str, timeout_s: float) -> Dict[str, Any]:
+    """
+    СИНХРОННАЯ версия функции для выполнения в отдельном потоке.
+    """
+    from openai import OpenAI
+    client = OpenAI(base_url=base_url, api_key="ollama", timeout=timeout_s - 1)
+    try:
+        resp = client.chat.completions.create(
+            model=model, messages=messages, response_format={"type": "json_object"}, temperature=0.2
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        return safe_parse_json(raw, default={"action": "REJECT", "justification": "bad json"})
+    except Exception as e:
+        logger.error(f"Ошибка в синхронном запросе к модели {model}: {e}")
+        if "timed out" in str(e).lower():
+             return {"action": "REJECT", "justification": f"AI HTTP Timeout Error: {e}"}
+        return {"action": "REJECT", "justification": f"AI Sync Error: {e}"}
+
+
+async def ask_ollama_json(model: str, messages: list[dict], timeout_s: float, base_url: str) -> Dict[str, Any]:
+    """
+    АСИНХРОННАЯ обертка, которая выполняет тяжелый, блокирующий запрос в отдельном потоке.
+    """
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_ask_ollama_json_sync, model, messages, base_url, timeout_s),
+            timeout=timeout_s
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.error(f"Общий таймаут ({timeout_s}с) при запросе к модели {model}.")
+        return {"action": "REJECT", "justification": f"Global Timeout ({timeout_s}s)"}
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка в async wrapper для {model}: {e}", exc_info=True)
+        return {"action": "REJECT", "justification": f"AI Wrapper Error: {e}"}
+
+
+
+# --- Формирование промптов ---
+
+def _format(v, spec, na="N/A"):
+    try:
+        x = float(v)
+        if np.isinf(x) or np.isnan(x): return na
+        return f"{x:{spec}}"
+    except (ValueError, TypeError):
+        return na
+
+
+# def build_primary_prompt(candidate: dict, features: dict, shared_ws) -> str:
+#     """
+#     [ИСПРАВЛЕННАЯ ВЕРСИЯ V12] Единый, унифицированный промпт,
+#     корректно работающий со всеми типами сигналов.
+#     """
+#     sym = candidate.get("symbol", "UNKNOWN")
+#     side = str(candidate.get("side", "Buy")).upper()
+#     source = candidate.get("source", "unknown")
+#     source_title = source.replace("_", " ").title()
+
+#     # --- Подготовка ключевых данных для анализа ---
+#     rsi_val = safe_to_float(features.get('rsi14'))
+#     adx_val = safe_to_float(features.get('adx14'))
+#     pct_5m = safe_to_float(features.get('pct5m'))
+#     pct_30m = safe_to_float(features.get('pct30m'))
+#     vol_anomaly = features.get('volume_anomaly', 1.0)
+    
+#     prompt_header = "SYSTEM: Ты — AI риск-менеджер Plutus. Твоя задача — дать четкий и однозначный вердикт по торговому сигналу: EXECUTE или REJECT. Твой ответ — всегда только валидный JSON."
+    
+#     # --- НАЧАЛО ИСПРАВЛЕНИЯ: Этот блок теперь является общим для всех ---
+#     prompt_data = f"""
+#     USER:
+#     **1. СИГНАЛ НА УТВЕРЖДЕНИЕ:**
+#     - Инструмент: {sym}, Направление: {side}, Стратегия: {source_title}
+
+#     **2. КЛЮЧЕВЫЕ ПОКАЗАТЕЛИ:**
+#     - Импульс (5м): {_format(pct_5m, '.2f')}%
+#     - Контекст (30м): {_format(pct_30m, '.2f')}%
+#     - RSI(14): {_format(rsi_val, '.1f')}
+#     - ADX(14) (Сила тренда): {_format(adx_val, '.1f')}
+#     - Аномалия объема (1m): {_format(vol_anomaly, '.1f')}x
+#     """
+#     # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+#     prompt_task = ""
+#     if 'squeeze' in source:
+#         prompt_task = """
+#         **3. ПРАВИЛА АНАЛИЗА (Squeeze - Контртренд):**
+#         Главный критерий — мы торгуем контртрендовым входом в сквиз, поэтому нужен экстремальный RSI на фоне сильного 5-минутного импульса.
+#         - Для 'SELL', если RSI > 75 — это сильный аргумент ЗА.
+#         - Для 'BUY', если RSI < 25 — это сильный аргумент ЗА.
+#         Оцени ADX как показатель силы импульса (чем выше, тем лучше для отката). Если видишь явное истощение, давай EXECUTE.
+#         """
+#     elif 'liquidation' in source:
+#         # Здесь мы используем скоринг, как и договаривались
+#         prompt_task = f"""
+#         **3. АЛГОРИТМ СКОРИНГА (Liquidation Cascade - Контртренд):**
+#         **Цель:** Войти против каскада ликвидаций.
+#         **Шаг 1: Базовые баллы (Порог: 75).**
+#         - Начисли **50 баллов** по умолчанию.
+#         **Шаг 2: Бонусные баллы (суммируются).**
+#         - Если `Аномалия объема` > 4.0x: **+20 баллов**.
+#         - Если RSI экстремальный (для 'BUY' < 25; для 'SELL' > 75): **+15 баллов**.
+#         - Если ADX > 45: **+10 баллов**.
+#         **Шаг 3: Финальный вердикт.**
+#         - **ЕСЛИ итоговый балл >= 75:** Вернуть "EXECUTE".
+#         - **ИНАЧЕ:** Вернуть "REJECT".
+#         """
+#     else:  # Golden Setup по умолчанию
+#         # --- НОВАЯ, УМНАЯ ЛОГИКА ДЛЯ GOLDEN SETUP ---
+#         prompt_task = f"""
+#         **3. АЛГОРИТМ АНАЛИЗА (Golden Setup - "Сжатая пружина"):**
+#         **Контекст:** Обнаружен паттерн накопления (рост ОИ, всплеск объема). Это сигнал ПРОДОЛЖЕНИЯ тренда.
+        
+#         **КРИТИЧЕСКИЙ ШАГ: Проверка контекста предшествующего движения.**
+#         Твоя главная задача — не попасть в ловушку на пике или дне рынка. Используй показатель `Контекст (30м)`.
+
+#         - **ЕСЛИ сигнал 'Buy', а `Контекст (30м)` уже показывает сильный рост (например, > 3.5%):**
+#           Это очень плохой знак. Вероятно, это не накопление, а распределение на пике. **Верни "REJECT".** Обоснование: "Высокий риск покупки на локальном максимуме".
+
+#         - **ЕСЛИ сигнал 'Sell', а `Контекст (30м)` уже показывает сильное падение (например, < -3.5%):**
+#           Это очень плохой знак. Вероятно, это не набор шорта, а паническая продажа на дне. **Верни "REJECT".** Обоснование: "Высокий риск продажи на локальном минимуме".
+
+#         - **ЕСЛИ предшествующее движение было слабым или боковым (-2% < `Контекст (30м)` < 2%):**
+#           Это **ИДЕАЛЬНЫЙ** сценарий. Сигнал очень сильный. **Верни "EXECUTE".**
+
+#         - Во всех остальных случаях оцени ситуацию комплексно.
+#         """
+    
+#     prompt_footer = """
+#     **4. ТВОЙ ВЕРДИКТ (JSON):**
+#     `{{"action": "EXECUTE" | "REJECT", "justification": "[Твое краткое экспертное заключение]"}}`
+#     """
+
+#     return f"{prompt_header}\n{prompt_data}\n{prompt_task}\n{prompt_footer}".strip()
+
+
+# def build_primary_prompt(candidate: dict, features: dict, shared_ws) -> str:
+#     """
+#     [ГИБРИДНАЯ ВЕРСИЯ] Получает от Python флаг о выполнении критического условия
+#     и дает AI строгие инструкции по его обработке.
+#     """
+#     sym = candidate.get("symbol", "UNKNOWN")
+#     side = str(candidate.get("side", "Buy")).upper()
+#     source_title = str(candidate.get("source", "unknown")).replace("_", " ").title()
+
+#     rsi_val = safe_to_float(features.get('rsi14'))
+#     adx_val = safe_to_float(features.get('adx14'))
+#     pct_5m = safe_to_float(features.get('pct5m'))
+    
+#     # --- НАЧАЛО КЛЮЧЕВОГО ИЗМЕНЕНИЯ ---
+#     # Получаем результат проверки от Python
+#     critical_condition_met = features.get('critical_condition_met', False)
+#     # --- КОНЕЦ КЛЮЧЕВОГО ИЗМЕНЕНИЯ ---
+
+#     prompt_header = "SYSTEM: Ты — AI риск-менеджер Plutus. Твоя задача — строго следовать алгоритму и дать вердикт: EXECUTE или REJECT. Твой ответ — всегда только валидный JSON."
+    
+#     prompt_data = f"""
+#     USER:
+#     **1. СИГНАЛ НА УТВЕРЖДЕНИЕ:**
+#     - Инструмент: {sym}, Направление: {side}, Стратегия: {source_title}
+
+#     **2. РЕЗУЛЬТАТ ПРОВЕРКИ КРИТИЧЕСКОГО УСЛОВИЯ (выполнено Python):**
+#     - **Критическое условие выполнено:** `{critical_condition_met}`
+#       (Для контртренда это означает, что RSI находится в экстремальной зоне: >75 для Sell, <25 для Buy)
+
+#     **3. ДОПОЛНИТЕЛЬНЫЕ РЫНОЧНЫЕ ПОКАЗАТЕЛИ:**
+#     - Импульс (5м): {_format(pct_5m, '.2f')}%
+#     - RSI(14): {_format(rsi_val, '.1f')}
+#     - ADX(14) (Сила тренда): {_format(adx_val, '.1f')}
+#     """
+
+#     # --- ИЗМЕНЯЕМ ЗАДАЧУ ДЛЯ AI ---
+#     prompt_task = """
+#     **4. ТВОЙ АЛГОРИТМ ПРИНЯТИЯ РЕШЕНИЯ:**
+#     1.  **ПРОВЕРЬ ФЛАГ `Критическое условие выполнено`.**
+#         - **ЕСЛИ флаг `False`:** Немедленно верни **REJECT**. Обоснование: "Критическое условие стратегии (RSI) не выполнено". Не анализируй другие данные.
+#         - **ЕСЛИ флаг `True`:** Переходи к шагу 2.
+
+#     2.  **Проанализируй остальные показатели на наличие явных "красных флагов".**
+#         - Красный флаг — это сильное противоречие. Например, для контртрендового сигнала 'Sell' сильный ADX (> 40) и продолжающийся рост импульса могут быть опасны.
+#         - **ЕСЛИ находишь серьезный красный флаг:** Верни **REJECT** и укажи его в обосновании.
+#         - **ЕСЛИ критическое условие `True` и явных красных флагов нет:** Верни **EXECUTE**.
+#     """
+    
+#     prompt_footer = """
+#     **5. ТВОЙ ВЕРДИКТ (JSON):**
+#     `{{"action": "EXECUTE" | "REJECT", "justification": "[Твое краткое экспертное заключение]"}}`
+#     """
+
+#     return f"{prompt_header}\n{prompt_data}\n{prompt_task}\n{prompt_footer}".strip()
+
+
+def build_final_confirmation_prompt(candidate: dict, features: dict) -> str:
+    """
+    [ФИНАЛЬНАЯ ПРОВЕРКА] Создает промпт для AI, который выступает последним рубежом
+    обороны перед исполнением сделки.
+    """
+    sym = candidate.get("symbol", "UNKNOWN")
+    side = str(candidate.get("side", "Buy")).upper()
+    source_title = str(candidate.get("source", "unknown")).replace("_", " ").title()
+
+    rsi_val = safe_to_float(features.get('rsi14'))
+    adx_val = safe_to_float(features.get('adx14'))
+    cvd_1m = features.get('CVD1m', 0)
+    vol_anomaly = features.get('volume_anomaly', 1.0)
+    
+    prompt_header = "SYSTEM: Ты — элитный риск-менеджер. Механические системы бота обнаружили качественный сигнал и готовы к входу. Твоя задача — провести финальную проверку на наличие очевидных ловушек и дать однозначный вердикт: EXECUTE или REJECT. Твой ответ — всегда только валидный JSON."
+    
+    prompt_data = f"""
+    USER:
+    **СИГНАЛ НА ФИНАЛЬНОЕ УТВЕРЖДЕНИЕ:**
+    - Инструмент: {sym}
+    - Направление: {side}
+    - Стратегия: {source_title}
+
+    **КОНТЕКСТ РЫНКА В МОМЕНТ ВХОДА:**
+    - RSI(14): {_format(rsi_val, '.1f')}
+    - ADX(14) (сила тренда): {_format(adx_val, '.1f')}
+    - CVD (1м): {_format(cvd_1m, ',.0f')}
+    - Аномалия объема (1м): x{_format(vol_anomaly, '.1f')}
+    """
+
+    prompt_task = """
+    **ТВОЯ ЗАДАЧА:**
+    Проверь данные на наличие явных противоречий.
+    - **Для пробоя (Breakout):** Убедись, что RSI подтверждает направление (для 'Buy' > 50, для 'Sell' < 50) и что тренд (ADX) достаточно силен (желательно > 20).
+    - **Для отбоя (Fade):** Убедись, что RSI в экстремальной зоне (для 'Buy' < 30, для 'Sell' > 70) и что тренд (ADX) не слишком сильный (желательно < 35-40), чтобы не идти против паровоза.
+
+    Если явных красных флагов нет, верни **EXECUTE**. Если видишь очевидную ловушку (например, вход в 'Buy' при RSI=20), верни **REJECT**.
+    """
+    
+    prompt_footer = """
+    **ТВОЙ ВЕРДИКТ (только JSON):**
+    `{{"action": "EXECUTE" | "REJECT", "justification": "[Твое краткое экспертное заключение]"}}`
+    """
+
+    return f"{prompt_header}\n{prompt_data}\n{prompt_task}\n{prompt_footer}".strip()
+
+
+
+
+def build_golden_entry_prompt(symbol: str, side: str, reference_price: float, last_price: float, features: dict) -> str:
+    """
+    Создает промпт для тактического AI, который ищет подтверждение
+    пробоя после фазы накопления.
+    """
+    price_change_pct = ((last_price - reference_price) / reference_price) * 100.0
+    cvd_1m = features.get('CVD1m', 0)
+    vol_anomaly = features.get('volume_anomaly', 1.0)
+    
+    prompt = f"""
+    SYSTEM: Ты аналитик пробоев. Твоя задача — подтвердить начало истинного импульсного движения после фазы накопления. Ответ — только JSON.
+    USER:
+    **1. СИГНАЛ (Golden Setup - "Сжатая пружина"):**
+    - Инструмент: {symbol}, Ожидаемое направление: {side.upper()}
+    - Цена на момент сигнала: {reference_price:.6f}, Текущая цена: {last_price:.6f}
+    - Движение от точки сигнала: {price_change_pct:+.2f}%
+
+    **2. КОНТЕКСТ ПРОБОЯ:**
+    - CVD(1m) Trend: {'Совпадает с направлением' if (side.upper() == 'BUY' and cvd_1m > 0) or (side.upper() == 'SELL' and cvd_1m < 0) else 'Противоречит'}
+    - Аномалия объема (1m): {_format(vol_anomaly, '.1f')}x
+
+    **3. ЗАДАЧА И АЛГОРИТМ:**
+    Твоя задача — отличить истинный пробой от ложного.
+    - **"EXECUTE":** Верни, если `Движение от точки сигнала` совпадает с направлением, `CVD Trend` совпадает, и `Аномалия объема` > 1.5x.
+    - **"WAIT":** Во всех остальных случаях.
+
+    **4. ФОРМАТ ОТВЕТА (JSON):**
+    - "action": "EXECUTE" или "WAIT"
+    - "reason": Краткое обоснование.
+    """
+    return prompt.strip()
+
+
+# def build_primary_prompt(candidate: dict, features: dict, shared_ws) -> str:
+#     sym = candidate.get("symbol", "UNKNOWN")
+#     side = str(candidate.get("side", "Buy")).upper()
+#     source_title = str(candidate.get("source", "unknown")).replace("_", " ").title()
+
+#     m = candidate.get("base_metrics", {})
+#     vol_change_pct = safe_to_float(m.get("vol_change_pct", 0.0))
+#     vol_anomaly = (vol_change_pct / 100.0) + 1.0
+
+#     trend = "Uptrend" if safe_to_float(features.get("supertrend", 0.0)) > 0 else "Downtrend"
+#     rsi_val = safe_to_float(features.get('rsi14'))
+    
+#     try:
+#         btc_change_1h = compute_pct(shared_ws.candles_data.get("BTCUSDT", []), 60)
+#         eth_change_1h = compute_pct(shared_ws.candles_data.get("ETHUSDT", []), 60)
+#     except Exception:
+#         btc_change_1h, eth_change_1h = 0.0, 0.0
+
+#     prompt_header = "SYSTEM: Ты - элитный трейдер и риск-менеджер. Твой ответ - всегда только валидный JSON, без лишних слов."
+    
+#     prompt_data = f"""
+#     USER:
+#     Анализ торгового сигнала:
+#     - Монета: {sym}, Направление: {side}, Источник: {source_title}
+#     - Метрики: PriceΔ(5m)={_format(m.get('pct_5m'), '.2f')}%, Volume Anomaly={_format(vol_anomaly, '.1f')}x, OIΔ(1m)={_format(m.get('oi_change_pct'), '.2f')}%
+#     - Контекст: Trend={trend}, ADX={_format(features.get('adx14'), '.1f')}, RSI={_format(rsi_val, '.1f')}
+#     - Движение за 30м: {_format(features.get('pct_30m'), '.2f')}%
+#     - Рынок: BTC Δ(1h)={_format(btc_change_1h, '.2f')}%, ETH Δ(1h)={_format(eth_change_1h, '.2f')}%
+#     """
+    
+#     source = candidate.get("source", "")
+    
+#     if 'squeeze' in source:
+#         rsi_condition_met = "НЕТ"
+#         if side == 'SELL' and rsi_val > 75:
+#             rsi_condition_met = "ДА"
+#         elif side == 'BUY' and rsi_val < 25:
+#             rsi_condition_met = "ДА"
+
+#         prompt_task = f"""
+#         **Стратегический контекст:** Мы торгуем КОНТРТРЕНДОВУЮ стратегию "Squeeze" (вход ПРОТИВ импульса).
+#         **Правила интерпретации:**
+#         1. Для входа 'SELL' (против роста) нужен перегретый RSI (>75).
+#         2. Для входа 'BUY' (против падения) нужен перепроданный RSI (<25).
+#         **Проверка условия RSI: {rsi_condition_met}**
+#         **ЗАДАЧА:** Учитывая, выполнено ли ключевое условие по RSI, и все остальные данные, верни JSON с "action" ("EXECUTE" или "REJECT"), "confidence_score" и "justification".
+#         """
+#     elif 'liquidation' in source:
+#         liq_side = m.get('liquidation_side', 'Unknown')
+#         prompt_task = f"""
+#         **Стратегический контекст:** Мы торгуем КОНТРТРЕНДОВУЮ стратегию на каскаде ликвидаций. Обнаружен крупный кластер ({liq_side}) на ${m.get('liquidation_value_usd'):,.0f}. Наша цель - войти в сделку ({side}) ПРОТИВ этих ликвидаций.
+#         **Правила интерпретации:**
+#         1.  Сигнал является контр-трендовым. Сильное отклонение цены и RSI являются подтверждением.
+#         2.  Оцени, является ли это событие кульминацией движения (хорошо для входа) или лишь его началом (плохо).
+#         **ЗАДАЧА:** Верни JSON с "action", "confidence_score" и "justification".
+#         """
+#     else: # Golden Setup и другие по умолчанию
+#         prompt_task = """
+#         **ЗАДАЧА:** Проанализируй сигнал с учетом нового критического правила. Верни JSON с ключами "confidence_score", "justification", "action" ("EXECUTE" или "REJECT").
+#         **КРИТИЧЕСКОЕ ПРАВИЛО:** Наша цель — избежать входа в конце сильного импульса.
+#         1.  Для сигнала 'BUY', если "Движение за 30м" уже > 5%, сигнал считается высокорискованным (покупка на пике).
+#         2.  Для сигнала 'SELL', если "Движение за 30м" уже < -5%, сигнал также считается высокорискованным (продажа на дне).
+#         Используй это правило как основной фактор для принятия решения о "REJECT". Если сигнал технически верен, но нарушает это правило, отклони его с соответствующим обоснованием.
+#         """
+
+#     return f"{prompt_header}\n{prompt_data}\n{prompt_task}".strip()
+
+
+# def build_primary_prompt(candidate: dict, features: dict, shared_ws) -> str:
+#     sym = candidate.get("symbol", "UNKNOWN")
+#     side = str(candidate.get("side", "Buy")).upper()
+#     source_title = str(candidate.get("source", "unknown")).replace("_", " ").title()
+
+#     m = candidate.get("base_metrics", {})
+#     vol_change_pct = safe_to_float(m.get("vol_change_pct", 0.0))
+#     vol_anomaly = (vol_change_pct / 100.0) + 1.0
+
+#     trend = "Uptrend" if safe_to_float(features.get("supertrend", 0.0)) > 0 else "Downtrend"
+#     rsi_val = safe_to_float(features.get('rsi14'))
+    
+#     try:
+#         btc_change_1h = compute_pct(shared_ws.candles_data.get("BTCUSDT", []), 60)
+#         eth_change_1h = compute_pct(shared_ws.candles_data.get("ETHUSDT", []), 60)
+#     except Exception:
+#         btc_change_1h, eth_change_1h = 0.0, 0.0
+
+#     prompt_header = "SYSTEM: Ты - опытный крипто-аналитик, элитный трейдер и риск-менеджер. Твой ответ - всегда только валидный JSON, без лишних слов."
+    
+#     prompt_data = f"""
+#     USER:
+#     Анализ торгового сигнала:
+#     - Монета: {sym}, Направление: {side}, Источник: {source_title}
+#     - Метрики: PriceΔ(5m)={_format(m.get('pct_5m'), '.2f')}%, Volume Anomaly={_format(vol_anomaly, '.1f')}x, OIΔ(1m)={_format(m.get('oi_change_pct'), '.2f')}%
+#     - Контекст: Trend={trend}, ADX={_format(features.get('adx14'), '.1f')}, RSI={_format(rsi_val, '.1f')}
+#     - Движение за 30м: {_format(features.get('pct_30m'), '.2f')}%
+#     - Рынок: BTC Δ(1h)={_format(btc_change_1h, '.2f')}%, ETH Δ(1h)={_format(eth_change_1h, '.2f')}%
+#     """
+    
+#     source = candidate.get("source", "")
+    
+#     if 'squeeze' in source:
+#         # Логика для Squeeze остается без изменений
+#         rsi_condition_met = "НЕТ"
+#         if side == 'SELL' and rsi_val > 75: rsi_condition_met = "ДА"
+#         elif side == 'BUY' and rsi_val < 25: rsi_condition_met = "ДА"
+#         prompt_task = f"""
+#         **Стратегический контекст:** Мы торгуем КОНТРТРЕНДОВУЮ стратегию "Squeeze", которая ищет подходящий момент на пике, или дне, движения. Желательный момент входы -- выдыхающийся импульс.
+#         **Правила интерпретации:** Для 'SELL' нужен RSI в зоне перекупленности (выше 75). Для 'BUY' нужен RSI в зоне перепроданности (ниже 25).
+#         **Проверка условия RSI: {rsi_condition_met}**
+#         **ЗАДАЧА:** Учитывая все данные, верни JSON с "action", "confidence_score" и "justification".
+#         """
+#     elif 'liquidation' in source:
+#         # Логика для Liquidation остается без изменений
+#         liq_side = m.get('liquidation_side', 'Unknown')
+#         prompt_task = f"""
+#         **Стратегический контекст:** Мы торгуем КОНТРТРЕНДОВУЮ стратегию на каскаде ликвидаций в момент ликвидации максимального кластера ликвидаций.
+#         **ЗАДАЧА:** Оцени, является ли это событие кульминацией движения (хорошо для входа) или лишь его началом (плохо). Верни JSON с "action", "confidence_score" и "justification".
+#         """
+#     else: # Golden Setup и другие по умолчанию
+#         # Убираем жесткое правило, так как его выполняет Python.
+#         # Просим AI просто учесть контекст.
+#         prompt_task = """
+#         **ЗАДАЧА:** Проанализируй сигнал. Удели особое внимание полю "Движение за 30м". Если оно велико, это повышает риск, даже если другие метрики выглядят хорошо. Верни JSON с ключами "confidence_score", "justification", "action" ("EXECUTE" или "REJECT").
+#         """
+
+#     return f"{prompt_header}\n{prompt_data}\n{prompt_task}".strip()
+
+# def build_primary_prompt(candidate: dict, features: dict, shared_ws) -> str:
+#     """
+#     [V11 - Корректные данные] Передает ИИ релевантные для каждой
+#     стратегии метрики движения.
+#     """
+#     sym = candidate.get("symbol", "UNKNOWN")
+#     side = str(candidate.get("side", "Buy")).upper()
+#     source = candidate.get("source", "unknown")
+#     source_title = source.replace("_", " ").title()
+
+#     # --- Подготовка ключевых данных для анализа ---
+#     rsi_val = safe_to_float(features.get('rsi14'))
+#     adx_val = safe_to_float(features.get('adx14'))
+#     pct_5m = safe_to_float(features.get('pct5m')) # Движение, вызвавшее сквиз
+#     pct_30m = safe_to_float(features.get('pct30m')) # Общий контекст
+#     vol_anomaly = features.get('volume_anomaly', 1.0)
+    
+#     prompt_header = "SYSTEM: Ты — AI риск-менеджер Plutus. Твоя задача — дать четкий и однозначный вердикт по торговому сигналу: EXECUTE или REJECT. Твой ответ — всегда только валидный JSON."
+    
+#     prompt_task = ""
+#     if 'squeeze' in source:
+#         prompt_data = f"""
+#         USER:
+#         **1. СИГНАЛ НА УТВЕРЖДЕНИЕ:**
+#         - Инструмент: {sym}, Направление: {side}, Стратегия: {source_title}
+
+#         **2. КЛЮЧЕВЫЕ ПОКАЗАТЕЛИ РИСКА:**
+#         - **Импульс сквиза (5м): {_format(pct_5m, '.2f')}%**
+#         - RSI(14): {_format(rsi_val, '.1f')}
+#         - ADX(14) (Сила тренда): {_format(adx_val, '.1f')}
+#         - Аномалия объема (1m): {_format(vol_anomaly, '.1f')}x
+#         - Общий контекст (30м): {_format(pct_30m, '.2f')}%
+#         """
+#         prompt_task = """
+#         **3. ПРАВИЛА ПРИНЯТИЯ РЕШЕНИЯ (Squeeze):**
+#         Это контртрендовый сигнал. Главный критерий — экстремальный RSI на фоне сильного 5-минутного импульса.
+#         - Для 'SELL', если RSI > 75 — это сильный аргумент ЗА.
+#         - Для 'BUY', если RSI < 25 — это сильный аргумент ЗА.
+#         Оцени ADX как показатель силы импульса (чем выше, тем лучше для отката). Если видишь явное истощение, давай EXECUTE.
+#         """
+
+#     elif 'liquidation' in source:
+#         prompt_task = f"""
+#         **2. АЛГОРИТМ СКОРИНГА (Liquidation Cascade - Контртренд):**
+#         **Цель:** Войти против каскада ликвидаций.
+#         **Шаг 1: Базовые баллы (Порог: 75).**
+#         - Начисли **50 баллов** по умолчанию.
+#         **Шаг 2: Бонусные баллы (суммируются).**
+#         - Если `Аномалия объема` > 4.0x: **+20 баллов**.
+#         - Если RSI экстремальный (для 'BUY' < 25; для 'SELL' > 75): **+15 баллов**.
+#         - Если ADX > 45: **+10 баллов**.
+#         **Шаг 3: Финальный вердикт.**
+#         - **ЕСЛИ итоговый балл >= 75:** Вернуть "EXECUTE".
+#         - **ИНАЧЕ:** Вернуть "REJECT".
+#         """
+
+
+#     # else:  # Golden Setup и другие
+#     #     prompt_data = f"""
+#     #     USER:
+#     #     **1. СИГНАЛ НА УТВЕРЖДЕНИЕ:**
+#     #     - Инструмент: {sym}, Направление: {side}, Стратегия: {source_title}
+
+#     #     **2. КЛЮЧЕВЫЕ ПОКАЗАТЕЛИ РИСКА:**
+#     #     - **Движение за 30м: {_format(pct_30m, '.2f')}%**
+#     #     - RSI(14): {_format(rsi_val, '.1f')}
+#     #     - ADX(14) (Сила тренда): {_format(adx_val, '.1f')}
+#     #     - Аномалия объема (1m): {_format(vol_anomaly, '.1f')}x
+#     #     """
+#     #     prompt_task = """
+#     #     **3. ПРАВИЛА ПРИНЯТИЯ РЕШЕНИЯ (Golden Setup):**
+#     #     Это трендовый сигнал. Главный критерий — сила тренда (ADX > 25) при отсутствии перегрева (`Движение за 30м` в разумных пределах).
+#     #     Оцени, не слишком ли поздно входить в движение. Если риск приемлем, давай EXECUTE.
+#     #     """
+    
+#     else:  # Golden Setup по умолчанию
+#         prompt_task = f"""
+#         **2. АЛГОРИТМ АНАЛИЗА (Golden Setup - "Сжатая пружина"):**
+#         **Контекст:** Обнаружен классический паттерн накопления/распределения. В течение 5 минут цена стояла на месте, в то время как Открытый Интерес значительно вырос. Последняя минута показала резкий всплеск объема. Это признаки того, что крупный игрок подготовил позицию и начинает импульсное движение.
+
+#         **Твоя задача:** Подтвердить сигнал. Убедись, что нет явных противоречащих факторов на старших таймфреймах (например, `Движение за 30м` не должно быть слишком большим в противоположную сторону). Если контекст благоприятный, давай "EXECUTE".
+#         """
+
+
+
+#     prompt_footer = """
+#     **4. ТВОЙ ВЕРДИКТ (JSON):**
+#     `{{"action": "EXECUTE" | "REJECT", "justification": "[Твое краткое экспертное заключение]"}}`
+#     """
+
+#     return f"{prompt_header}\n{prompt_data}\n{prompt_task}\n{prompt_footer}".strip()
+
+
+
+
+# def build_primary_prompt(candidate: dict, features: dict, shared_ws) -> str:
+#     """
+#     [ГИБРИДНАЯ ВЕРСИЯ V8] Python проверяет базовое условие, чтобы избежать
+#     математических галлюцинаций. AI выполняет остальной скоринг на основе
+#     этого результата.
+#     """
+#     sym = candidate.get("symbol", "UNKNOWN")
+#     side = str(candidate.get("side", "Buy")).upper()
+#     source = candidate.get("source", "unknown")
+#     source_title = source.replace("_", " ").title()
+
+#     # --- Подготовка ключевых данных для анализа ---
+#     rsi_val = safe_to_float(features.get('rsi14'))
+#     adx_val = safe_to_float(features.get('adx14'))
+#     pct_30m = safe_to_float(features.get('pct_30m'))
+#     vol_1m = features.get('vol1m', 0)
+#     avg_vol_30m = features.get('avgVol30m', 1)
+#     vol_anomaly = vol_1m / avg_vol_30m if avg_vol_30m > 0 else 1.0
+#     cvd_1m = features.get('CVD1m', 0)
+    
+#     m = candidate.get("base_metrics", {})
+
+#     # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ В PYTHON ---
+#     base_condition_result = "УСЛОВИЕ НЕ ВЫПОЛНЕНО"
+#     if 'squeeze' in source:
+#         if side == 'SELL' and rsi_val > 78:
+#             base_condition_result = "УСЛОВИЕ ВЫПОЛНЕНО"
+#         elif side == 'BUY' and rsi_val < 22:
+#             base_condition_result = "УСЛОВИЕ ВЫПОЛНЕНО"
+
+#     # --- Сборка промпта ---
+#     prompt_header = "SYSTEM: Ты — элитный торговый алгоритм. Твоя задача — оценить сигнал по системе скоринга и принять решение. Твой ответ — всегда только валидный JSON."
+    
+#     prompt_data = f"""
+#     USER:
+#     **1. ВХОДНЫЕ ДАННЫЕ:**
+#     - Сигнал: {source_title} на {sym}, Направление: {side}
+#     - Ключевые метрики: RSI={_format(rsi_val, '.1f')}, ADX={_format(adx_val, '.1f')}, Аномалия объема (1m)={_format(vol_anomaly, '.1f')}x, CVD (1m)={_format(cvd_1m, ',.0f')}
+#     - Контекст движения: Движение за 30м={_format(pct_30m, '.2f')}%
+#     """
+
+#     prompt_task = ""
+#     if 'squeeze' in source:
+#         prompt_task = f"""
+#         **2. АЛГОРИТМ СКОРИНГА (Squeeze - Контртренд):**
+#         **Цель:** Войти против импульса в момент его истощения.
+        
+#         **Шаг 1: Проверка базового условия, выполненная системой.**
+#         - **Результат:** **{base_condition_result}**
+        
+#         **Шаг 2: Расчет баллов.**
+#         - Если результат "УСЛОВИЕ ВЫПОЛНЕНО", начисли **60 базовых баллов**. Иначе итоговый балл = 0.
+#         - Если базовый балл > 0, добавь бонусные баллы:
+#           - Если ADX > 40: **+15 баллов**.
+#           - Если `Аномалия объема` > 2.5x: **+15 баллов**.
+#           - Если CVD подтверждает разворот (для 'SELL' CVD < 0; для 'BUY' CVD > 0): **+10 баллов**.
+
+#         **Шаг 3: Финальный вердикт.**
+#         - Подсчитай итоговый балл.
+#         - **ЕСЛИ итоговый балл >= 70:** Вернуть "EXECUTE".
+#         - **ИНАЧЕ:** Вернуть "REJECT".
+#         """
+#     elif 'liquidation' in source:
+#         # Логика для ликвидаций остается прежней, она не зависит от точных сравнений
+#         prompt_task = f"""
+#         **2. АЛГОРИТМ СКОРИНГА (Liquidation Cascade - Контртренд):**
+#         **Цель:** Войти против каскада ликвидаций.
+#         **Шаг 1: Базовые баллы (Порог: 75).**
+#         - Начисли **50 баллов** по умолчанию.
+#         **Шаг 2: Бонусные баллы (суммируются).**
+#         - Если `Аномалия объема` > 4.0x: **+20 баллов**.
+#         - Если RSI экстремальный (для 'BUY' < 25; для 'SELL' > 75): **+15 баллов**.
+#         - Если ADX > 45: **+10 баллов**.
+#         **Шаг 3: Финальный вердикт.**
+#         - **ЕСЛИ итоговый балл >= 75:** Вернуть "EXECUTE".
+#         - **ИНАЧЕ:** Вернуть "REJECT".
+#         """
+#     else:  # Golden Setup по умолчанию
+#         # Логика для Golden Setup также не требует точных сравнений от AI
+#         prompt_task = f"""
+#         **2. АЛГОРИТМ СКОРИНГА (Golden Setup - Тренд):**
+#         **Цель:** Войти в сильный, но не "перегретый" тренд.
+#         **Шаг 1: Базовые баллы (Порог: 65).**
+#         - Если ADX > 25: начисли **50 баллов**.
+#         - Если CVD и OI подтверждают направление: **+15 баллов**.
+#         *Если ADX < 25, итоговый балл = 0.*
+#         **Шаг 2: Штрафные баллы за "перегретость".**
+#         - Если `Движение за 30м` > 3.5% (или < -3.5% для SELL): **-15 баллов**.
+#         - Если `Движение за 30м` > 5.0% (или < -5.0% для SELL): **-30 баллов** (заменяет предыдущий штраф).
+#         **Шаг 3: Финальный вердикт.**
+#         - **ЕСЛИ итоговый балл >= 65:** Вернуть "EXECUTE".
+#         - **ИНАЧЕ:** Вернуть "REJECT".
+#         """
+    
+#     prompt_footer = """
+#     **3. ФОРМАТ ОТВЕТА (СТРОГО JSON):**
+#     `{{"action": "EXECUTE" | "REJECT", "justification": "Итоговый балл: [балл]. [Ключевые факторы, повлиявшие на решение]"}}`
+#     """
+
+#     return f"{prompt_header}\n{prompt_data}\n{prompt_task}\n{prompt_footer}".strip()
+
+
+def build_position_management_prompt(symbol: str, pos: dict, features: dict) -> str:
+    """
+    [V5 - ИСПРАВЛЕННЫЙ АЛГОРИТМ] Промпт для AI, который передает все необходимые
+    данные (включая текущую цену) и дает строгие инструкции, исключая галлюцинации.
+    """
+    side = pos.get('side', '').upper()
+    current_roi = pos.get('current_roi', 0.0)
+    adx_val = features.get('adx14', 0.0)
+    atr_val = features.get('atr14', 0.0)
+    last_price = features.get('price', 0.0) # <--- ПОЛУЧАЕМ ТЕКУЩУЮ ЦЕНУ
+
+    prompt_header = "SYSTEM: Ты — элитный AI-трейдер, исполняющий алгоритм управления позицией. Твоя задача — строго следовать инструкциям и вернуть JSON с результатом. Не добавляй свою интерпретацию."
+    prompt_data = f"""
+    USER:
+    **1. ВХОДНЫЕ ДАННЫЕ ДЛЯ РАСЧЕТА:**
+    - Инструмент: {symbol}, Направление: {side}, ROI: {current_roi:.2f}%
+    - **Текущая цена (CURRENT_PRICE): {last_price:.6f}** 
+    - ADX(14) (Сила тренда): {adx_val:.1f}
+    - ATR(14) (Волатильность): {atr_val:.6f}
+    """
+    
+    prompt_task = f"""
+    **2. ТВОЯ ЗАДАЧА: ТОЧНО ИСПОЛНИТЬ АЛГОРИТМ.**
+    Проанализируй **только** показатель ADX и верни JSON, строго следуя правилам ниже. Используй `CURRENT_PRICE` для всех расчетов.
+
+    **ШАГ 1: АЛГОРИТМ РАСЧЕТА МНОЖИТЕЛЯ ATR (`new_atr_multiplier`).**
+    - **ЕСЛИ ADX > 30:** `new_atr_multiplier` = 3.0.
+    - **ЕСЛИ ADX находится в диапазоне от 20 до 30 (включительно):** `new_atr_multiplier` = 2.5.
+    - **ЕСЛИ ADX < 20:** `new_atr_multiplier` = 1.8.
+
+    **ШАГ 2: АЛГОРИТМ РАСЧЕТА TAKE PROFIT (`take_profit_price`).**
+    - **ЕСЛИ ADX > 30 (сильный тренд):** Цель = `CURRENT_PRICE` +/- (ATR * 4.0).
+    - **ЕСЛИ ADX 20-30 (умеренный тренд):** Цель = `CURRENT_PRICE` +/- (ATR * 3.0).
+    - **ЕСЛИ ADX < 20 (слабый тренд):** Цель = `CURRENT_PRICE` +/- (ATR * 2.0).
+    (Используй "+" для {side} позиций, если это BUY, и "-" если это SELL. И наоборот для SELL позиций)
+
+    **3. ФОРМАТ ОТВЕТА (СТРОГО JSON):**
+    Верни JSON с ключами `action`, `reason`, `new_atr_multiplier` и `take_profit_price`.
+    - В `reason` кратко укажи, какое правило ADX было применено.
+    `{{"action": "UPDATE_TACTICS", "reason": "[ADX < 20. Слабый тренд, агрессивная защита.]", "new_atr_multiplier": [число], "take_profit_price": [число]}}`
+    """
+    
+    return f"{prompt_header}\n{prompt_data}\n{prompt_task}".strip()
+
+# def build_squeeze_entry_prompt(symbol: str, side: str, extreme_price: float, last_price: float, features: dict) -> str:
+#     pullback_pct = abs(last_price - extreme_price) / extreme_price * 100
+#     cvd_1m = features.get('CVD1m', 0)
+#     vol_1m = features.get('vol1m', 0)
+#     avg_vol_30m = features.get('avgVol30m', 1)
+#     vol_anomaly = vol_1m / avg_vol_30m if avg_vol_30m > 0 else 1.0
+#     rsi_val = safe_to_float(features.get('rsi14'))
+
+
+#     prompt = f"""
+#     SYSTEM: Ты аналитик микроструктуры рынка. Твоя задача - определить оптимальный момент для КОНТРТРЕНДОВОГО входа в момент выдыхающегося сквиза. То есть если RSI выше 75 для "SELL" или ниже 25 для "BUY". Ответ - только валидный JSON.
+#     USER:
+#     **Сигнал (Squeeze):**
+#     - Инструмент: {symbol}, Направление входа: {side.upper()}
+#     - Пик/дно импульса: {extreme_price:.6f}, Текущая цена: {last_price:.6f}
+#     - Откат от пика/дна: {pullback_pct:.2f}%
+#     - RSI экстремальный для "SELL": {rsi_val} > 80
+#     - RSI экстремальный для "BUY": {rsi_val} < 25
+#     **Контекст отката:**
+#     - RSI(14): {_format(features.get('rsi14'), '.1f')}
+#     - CVD(1m) Trend: {'Растет' if cvd_1m > 0 else 'Падает'} ({cvd_1m:,.0f})
+#     - Аномалия объема (1m): {_format(vol_anomaly, '.1f')}x от среднего
+#     **ЗАДАЧА:** Ищи признаки ИСТОЩЕНИЯ импульса. Является ли СЕЙЧАС оптимальный момент для входа? Верни JSON:
+#     - "action": "EXECUTE" (только при явных признаках разворота) или "WAIT".
+#     - "reason": Краткое обоснование.
+#     """
+#     return prompt.strip()
+
+# def build_squeeze_entry_prompt(symbol: str, side: str, extreme_price: float, last_price: float, features: dict) -> str:
+#     """
+#     [ЖЕЛЕЗОБЕТОННАЯ ВЕРСИЯ V3] Дает ИИ строгие, недвусмысленные приказы,
+#     полностью исключая возможность творческой интерпретации.
+#     """
+#     pullback_pct = abs(last_price - extreme_price) / extreme_price * 100
+#     cvd_1m = features.get('CVD1m', 0)
+#     vol_1m = features.get('vol1m', 0)
+#     avg_vol_30m = features.get('avgVol30m', 1)
+#     vol_anomaly = vol_1m / avg_vol_30m if avg_vol_30m > 0 else 1.0
+#     rsi_val = safe_to_float(features.get('rsi14'))
+
+#     # --- Python надежно проверяет базовое условие ---
+#     base_condition_met_flag = False
+#     if side.upper() == 'SELL' and rsi_val > 75:
+#         base_condition_met_flag = True
+#     elif side.upper() == 'BUY' and rsi_val < 25:
+#         base_condition_met_flag = True
+
+#     # --- Python надежно проверяет подтверждающие условия ---
+#     cvd_confirms_flag = (side.upper() == 'SELL' and cvd_1m < 0) or \
+#                         (side.upper() == 'BUY' and cvd_1m > 0)
+#     volume_confirms_flag = vol_anomaly > 2.5
+
+#     prompt = f"""
+#     SYSTEM: Ты — исполнительный модуль торгового алгоритма. Твоя задача — строго следовать инструкциям и вернуть JSON. Не рассуждай и не добавляй свои критерии.
+#     USER:
+#     **1. СИГНАЛ (Squeeze):**
+#     - Инструмент: {symbol}, Направление входа: {side.upper()}
+
+#     **2. РЕЗУЛЬТАТЫ СИСТЕМНОГО АНАЛИЗА (уже посчитаны):**
+#     - Иссякающий сквиз для **{side.upper()}**
+#     - Базовое условие по RSI выполнено: **{base_condition_met_flag}**
+#     - CVD подтверждает разворот: **{cvd_confirms_flag}**
+#     - Есть аномалия объема: **{volume_confirms_flag}**
+
+#     **3. ТВОЙ ПРИКАЗ:**
+#     - **ЕСЛИ `Базовое условие по RSI` == `False`:** Немедленно вернуть "WAIT".
+#     - **ЕСЛИ `Базовое условие по RSI` == `True`:**
+#         - **И ЕСЛИ (`CVD подтверждает разворот` == `True` ИЛИ `Есть аномалия объема` == `True`):** Немедленно вернуть "EXECUTE".
+#         - **ИНАЧЕ (нет ни одного подтверждения):** Вернуть "WAIT".
+
+#     **4. ФОРМАТ ОТВЕТА (JSON):**
+#     - "action": "EXECUTE" или "WAIT"
+#     - "reason": Кратко перечисли, какие флаги (`True`/`False`) привели к решению.
+#     """
+#     return prompt.strip()
+
+# def build_squeeze_entry_prompt(symbol: str, side: str, extreme_price: float, last_price: float, features: dict) -> str:
+#     """
+#     [ЖЕЛЕЗОБЕТОННАЯ ВЕРСИЯ V3] Дает ИИ строгие, недвусмысленные приказы,
+#     полностью исключая возможность творческой интерпретации.
+#     """
+#     pullback_pct = abs(last_price - extreme_price) / extreme_price * 100
+#     cvd_1m = features.get('CVD1m', 0)
+#     vol_1m = features.get('vol1m', 0)
+#     avg_vol_30m = features.get('avgVol30m', 1)
+#     vol_anomaly = vol_1m / avg_vol_30m if avg_vol_30m > 0 else 1.0
+#     rsi_val = safe_to_float(features.get('rsi14'))
+
+#     # --- Python надежно проверяет базовое условие ---
+#     base_condition_met_flag = False
+#     if side.upper() == 'SELL' and rsi_val > 75:
+#         base_condition_met_flag = True
+#     elif side.upper() == 'BUY' and rsi_val < 25:
+#         base_condition_met_flag = True
+
+#     # --- Python надежно проверяет подтверждающие условия ---
+#     cvd_confirms_flag = (side.upper() == 'SELL' and cvd_1m < 0) or \
+#                         (side.upper() == 'BUY' and cvd_1m > 0)
+#     volume_confirms_flag = vol_anomaly > 2.5
+
+#     prompt = f"""
+#     SYSTEM: Ты — профессиональный крипто-трейдер с колоссальным опытом анализа крипто=рынка. Твоя задача — оценить ключевые критерии, которые указаны, найти идеальный ммомент в иссякающем лонг- или шортзсквизе для входа в позицию и вернуть JSON. Возможны только три варианта решения: REJECT, EXECUTE, WAIT.
+#     USER:
+#     **1. СИГНАЛ (Squeeze):**
+#     - Инструмент: {symbol}, Направление входа: {side.upper()}
+
+#     **2. РЕЗУЛЬТАТЫ СИСТЕМНОГО АНАЛИЗА (уже посчитаны):**
+#     - Иссякающий сквиз для **{side.upper()}**
+#     - Базовое условие по RSI выполнено: **{base_condition_met_flag}**
+#     - CVD подтверждает разворот: **{cvd_confirms_flag}**
+#     - Есть аномалия объема: **{volume_confirms_flag}**
+
+#     **3. ТВОЙ ПРИКАЗ:**
+#     - **ЕСЛИ `Базовое условие по RSI` == `False`:** Немедленно вернуть "WAIT".
+#     - **ЕСЛИ `Базовое условие по RSI` == `True`:**
+#         - **И ЕСЛИ (`CVD подтверждает разворот` == `True` ИЛИ `Есть аномалия объема` == `True`):** Немедленно вернуть "EXECUTE".
+#         - **ИНАЧЕ (нет ни одного подтверждения):** Вернуть "WAIT".
+
+#     **4. ФОРМАТ ОТВЕТА (JSON):**
+#     - "action": "EXECUTE" или "WAIT"
+#     - "reason": Кратко перечисли, какие флаги (`True`/`False`) привели к решению.
+#     """
+#     return prompt.strip()
+
+
+# def build_squeeze_entry_prompt(symbol: str, side: str, extreme_price: float, last_price: float, features: dict) -> str:
+#     """
+#     [ЭКСПЕРТНАЯ ВЕРСИЯ V4] Учит тактический AI ждать комбинации из
+#     нескольких признаков истощения импульса.
+#     """
+#     pullback_pct = 0
+#     if extreme_price > 0:
+#         pullback_pct = abs(last_price - extreme_price) / extreme_price * 100
+
+#     # Получаем необходимые фичи
+#     rsi_val = safe_to_float(features.get('rsi14'))
+#     cvd_1m = features.get('CVD1m', 0)
+#     vol_anomaly = features.get('volume_anomaly', 1.0)
+
+#     funding_rate = bot_core._funding_snapshot()
+
+#     # --- Python надежно проверяет условия и передает флаги ---
+#     rsi_ok = (side.upper() == 'SELL' and rsi_val > 80) or \
+#              (side.upper() == 'BUY' and rsi_val < 20)
+
+#     cvd_divergence = (side.upper() == 'SELL' and cvd_1m < 0) or \
+#                      (side.upper() == 'BUY' and cvd_1m > 0)
+    
+#     volume_exhaustion = vol_anomaly < 0.7 # Объем упал ниже 70% от среднего после пика
+    
+#     pullback_started = pullback_pct > 0.3 # Начался откат более чем на 0.3%
+
+#     prompt = f"""
+#     SYSTEM: Ты — высокоточный тактический анализатор и AI-аналитик последней инстанции. Твоя задача — определить ТОЧНЫЙ момент для контртрендового входа, дождавшись подтверждения истощения импульса и . Ответ — только JSON.
+#     USER:
+#     **1. СИГНАЛ НА ПОДТВЕРЖДЕНИЕ ВХОДА (Squeeze):**
+#     - Инструмент: {symbol}, Направление: {side.upper()}
+#     - **Событие:** Программный код обнаружил идеальные условия для входа: сильный сквиз + благоприятный фандинг.
+
+#     **2. РЕЗУЛЬТАТЫ СИСТЕМНОГО АНАЛИЗА (флаги):**
+#     - RSI в экстремальной зоне: **{rsi_ok}**
+#     - CVD показывает дивергенцию: **{cvd_divergence}**
+#     - Объем показывает истощение: **{volume_exhaustion}**
+#     - Начался откат от пика/дна: **{pullback_started}**
+#     - Фандинг благоприятный для открыттия позиции **{funding_rate}**
+
+#     **3. АЛГОРИТМ ПРИНЯТИЯ РЕШЕНИЯ ("Правило Двух Факторов"):**
+#     - Подсчитай количество флагов со значением `True`.
+#     - **ЕСЛИ количество `True` >= 2:** Вернуть "EXECUTE". Это означает, что есть как минимум два подтверждения разворота.
+#     - **ИНАЧЕ:** Вернуть "WAIT".
+
+#     **4. ФОРМАТ ОТВЕТА (JSON):**
+#     - "action": "EXECUTE" или "WAIT"
+#     - "reason": Кратко перечисли, какие флаги были `True`.
+#     """
+#     return prompt.strip()
+
+
+def build_squeeze_entry_prompt(symbol: str, side: str, extreme_price: float, last_price: float, features: dict, funding_rate: float) -> str:
+    """
+    [ЭКСПЕРТНАЯ ВЕРСИЯ V5] Использует Python для всех проверок, включая фандинг,
+    и просит AI принять финальное решение по "Правилу Трех Факторов".
+    """
+    # --- Python надежно проверяет все условия и готовит флаги ---
+    
+    # 1. RSI
+    rsi_val = safe_to_float(features.get('rsi14'))
+    rsi_ok = (side.upper() == 'SELL' and rsi_val > 75) or \
+             (side.upper() == 'BUY' and rsi_val < 20)
+
+    # 2. Фандинг
+    HOT_FUNDING_THRESHOLD = 0.04
+    funding_ok = (side.upper() == 'SELL' and funding_rate >= HOT_FUNDING_THRESHOLD) or \
+                 (side.upper() == 'BUY' and funding_rate <= -HOT_FUNDING_THRESHOLD)
+
+    # 3. Откат от пика/дна
+    pullback_pct = 0
+    if extreme_price > 0:
+        pullback_pct = abs(last_price - extreme_price) / extreme_price * 100
+    pullback_started = pullback_pct > 0.3
+
+    # 4. Дивергенция по CVD
+    cvd_1m = features.get('CVD1m', 0)
+    cvd_divergence = (side.upper() == 'SELL' and cvd_1m < 0) or \
+                     (side.upper() == 'BUY' and cvd_1m > 0)
+    
+    # --- Сборка промпта ---
+    prompt = f"""
+    SYSTEM: Ты — высокоточный тактический анализатор. Твоя задача — строго следовать алгоритму и вернуть JSON. Не рассуждай.
+    USER:
+    **1. СИГНАЛ НА ПОДТВЕРЖДЕНИЕ ВХОДА (Squeeze):**
+    - Инструмент: {symbol}, Направление: {side.upper()}
+
+    **2. РЕЗУЛЬТАТЫ СИСТЕМНОГО АНАЛИЗА (флаги):**
+    - Благоприятный фандинг: **{funding_ok}**
+    - RSI в экстремальной зоне: **{rsi_ok}**
+    - Начался откат от пика/дна: **{pullback_started}**
+    - CVD показывает дивергенцию: **{cvd_divergence}**
+
+    **3. АЛГОРИТМ ПРИНЯТИЯ РЕШЕНИЯ ("Правило Трех Факторов"):**
+    - **Главное условие:** `Благоприятный фандинг` должен быть `True`. Если он `False`, немедленно верни "WAIT".
+    - **Если `Благоприятный фандинг` == `True`,** посчитай количество `True` среди остальных трех флагов (RSI, Откат, CVD).
+    - **ЕСЛИ количество `True` >= 2:** Вернуть "EXECUTE". Это означает, что есть фандинг + как минимум два технических подтверждения.
+    - **ИНАЧЕ:** Вернуть "WAIT".
+
+    **4. ФОРМАТ ОТВЕТА (JSON):**
+    - "action": "EXECUTE" или "WAIT"
+    - "reason": Кратко перечисли, какие флаги были `True`.
+    """
+    return prompt.strip()

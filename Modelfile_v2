@@ -1,0 +1,9 @@
+    # Начинаем с нашей текущей модели в качестве основы
+    FROM trading-llama
+
+    # Указываем, кто автор новой модели
+    PARAMETER author "Jarvis Fine-Tuning"
+
+    # Указываем путь к нашему подготовленному датасету
+    # Ollama сама найдет его в текущей папке
+    PARAMETER messages "finetune_dataset.jsonl"
